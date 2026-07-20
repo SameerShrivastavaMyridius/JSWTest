@@ -42,6 +42,11 @@ $RECYCLE.BIN/
 # Local environment variables
 .env
 
+# Local credential/secret scratch files - never commit
+cred.txt
+*.key
+server.key
+
 # Python Salesforce Functions
 **/__pycache__/
 **/.venv/
