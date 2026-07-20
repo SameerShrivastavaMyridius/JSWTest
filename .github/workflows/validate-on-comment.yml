@@ -1,0 +1,402 @@
+name: Salesforce Validation on PR Comment
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger: a developer comments "VALIDATE" (any casing) on a Pull Request.
+# Effect:  runs a check-only (--dry-run) Salesforce deployment against the
+#          sandbox assigned to the commenter, then reports the result back
+#          as a PR comment. Nothing is ever deployed by this workflow.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  # Re-running VALIDATE on the same PR cancels any validation already
+  # in-flight for that PR instead of queuing behind it.
+  group: sf-validate-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    # Guard clause: only proceed for PR comments (issue_comment fires for
+    # plain issues too) that literally contain the word VALIDATE.
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, 'ALIDATE')
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Resolve PR details ────────────────────────────────────────────
+      # issue_comment events do not include github.event.pull_request (only
+      # issue_comment.issue.pull_request, which has no head SHA/branch), so
+      # the PR must be fetched explicitly from the REST API.
+      - name: Fetch PR details
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.issue.pull_request.url }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE=$(curl -sS -w '\n%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "$PR_URL")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::GitHub API failure fetching PR details (HTTP $HTTP_CODE)"
+            echo "$BODY"
+            echo "api_failure=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          {
+            echo "number=$(echo "$BODY" | jq -r '.number')"
+            echo "head_sha=$(echo "$BODY" | jq -r '.head.sha')"
+            echo "head_ref=$(echo "$BODY" | jq -r '.head.ref')"
+            echo "base_ref=$(echo "$BODY" | jq -r '.base.ref')"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "✓ PR #$(echo "$BODY" | jq -r '.number') → head $(echo "$BODY" | jq -r '.head.ref')@$(echo "$BODY" | jq -r '.head.sha')"
+
+      - name: Report PR fetch failure
+        if: failure() && steps.pr.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '### ⚠️ Validation could not start',
+                '',
+                '**Reason:** Failed to fetch Pull Request details from the GitHub API.',
+                'This is usually transient — try commenting `VALIDATE` again.',
+                '',
+                `[View logs](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+              ].join('\n')
+            });
+
+      # ── 2. Checkout the PR HEAD commit ──────────────────────────────────
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 1
+
+      # ── 3. Map the commenting GitHub user → their assigned sandbox ─────
+      # GitHub Actions cannot reference a secret by a dynamically built name
+      # (e.g. secrets[myVar] is NOT supported the way env vars are), so the
+      # mapping is resolved to a fixed, known secret-name *suffix* here, and
+      # every downstream step selects the right secret via a static
+      # secrets.SALESFORCE_<SUFFIX>_XXX reference behind a matching `if:`.
+      #
+      # To onboard a new developer:
+      #   1. Add one `case` entry below (GitHub login, lowercase → suffix).
+      #   2. Add the matching SALESFORCE_<SUFFIX>_{CLIENT_ID,JWT_KEY,
+      #      USERNAME,LOGIN_URL} secrets (Settings → Secrets and variables → Actions).
+      #   3. Duplicate the "Write JWT key (Sameer)" / "Authenticate (Sameer)"
+      #      step pair further down, swapping in the new suffix.
+      - name: Resolve commenter → sandbox
+        id: user
+        run: |
+          set -euo pipefail
+          GH_USER=$(echo "${{ github.event.comment.user.login }}" | tr '[:upper:]' '[:lower:]')
+          echo "Commenter: $GH_USER"
+
+          case "$GH_USER" in
+            sameershrivastavamyridius)
+              echo "suffix=SAMEER"        >> "$GITHUB_OUTPUT"
+              echo "sandbox_label=Sameer Sandbox (jswdev)" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::No sandbox mapping found for GitHub user '$GH_USER'"
+              echo "unknown_user=true" >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
+
+      - name: Report unknown user
+        if: failure() && steps.user.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commenter = context.payload.comment.user.login;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '### ⚠️ Validation could not start',
+                '',
+                `**Reason:** GitHub user \`${commenter}\` has no Salesforce sandbox mapped.`,
+                'Ask a repo admin to add an entry to the `Resolve commenter → sandbox` step',
+                'in `.github/workflows/validate-on-comment.yml` and the matching secrets.',
+                '',
+                `[View logs](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+              ].join('\n')
+            });
+
+      # ── 4. Resolve the deployment manifest ──────────────────────────────
+      # Priority: .github/packages/<feature-branch>-package.xml, then the
+      # project's package.xml (root, or the sfdx-cli default manifest/ path).
+      - name: Resolve manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          FEATURE_NAME=$(echo "${{ steps.pr.outputs.head_ref }}" | sed 's|[/]|-|g')
+          FEATURE_MANIFEST=".github/packages/${FEATURE_NAME}-package.xml"
+
+          if [ -f "$FEATURE_MANIFEST" ]; then
+            echo "manifest=$FEATURE_MANIFEST" >> "$GITHUB_OUTPUT"
+            echo "✓ Using feature manifest: $FEATURE_MANIFEST"
+          elif [ -f "package.xml" ]; then
+            echo "manifest=package.xml" >> "$GITHUB_OUTPUT"
+            echo "⚠ Falling back to root package.xml"
+          elif [ -f "manifest/package.xml" ]; then
+            echo "manifest=manifest/package.xml" >> "$GITHUB_OUTPUT"
+            echo "⚠ Falling back to manifest/package.xml"
+          else
+            echo "::error::No manifest found. Looked for $FEATURE_MANIFEST, ./package.xml, ./manifest/package.xml"
+            echo "missing_manifest=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Report missing manifest
+        if: failure() && steps.manifest.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '### ⚠️ Validation could not start',
+                '',
+                '**Reason:** No deployment manifest found.',
+                'Add either `.github/packages/<feature-branch>-package.xml` or a root `package.xml`.',
+                '',
+                `[View logs](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+              ].join('\n')
+            });
+
+      # ── 5. Toolchain ─────────────────────────────────────────────────────
+      - name: Setup Node.js
+        if: steps.manifest.outputs.manifest != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Salesforce CLI
+        if: steps.manifest.outputs.manifest != ''
+        run: npm install --global @salesforce/cli
+
+      # ── 6. JWT authentication ────────────────────────────────────────────
+      # Conditional per-user auth: GitHub Actions can't index `secrets` with
+      # a runtime variable, so one block per known suffix is guarded by an
+      # `if:` on steps.user.outputs.suffix. Exactly one of these runs.
+      - name: Write JWT key (Sameer)
+        if: steps.user.outputs.suffix == 'SAMEER'
+        env:
+          JWT_KEY: ${{ secrets.SALESFORCE_SAMEER_JWT_KEY }}
+        run: |
+          umask 077
+          echo "$JWT_KEY" > ./server.key
+
+      - name: Authenticate (Sameer)
+        if: steps.user.outputs.suffix == 'SAMEER'
+        id: auth_sameer
+        run: |
+          sf org login jwt \
+            --client-id "${{ secrets.SALESFORCE_SAMEER_CLIENT_ID }}" \
+            --jwt-key-file ./server.key \
+            --username "${{ secrets.SALESFORCE_SAMEER_USERNAME }}" \
+            --instance-url "${{ secrets.SALESFORCE_SAMEER_LOGIN_URL }}" \
+            --alias target-org \
+            --set-default
+
+      # ── Template for the next developer onboarded ───────────────────────
+      # Copy the two steps above, then uncomment and fill in below:
+      #
+      # - name: Write JWT key (<Name>)
+      #   if: steps.user.outputs.suffix == '<SUFFIX>'
+      #   env:
+      #     JWT_KEY: ${{ secrets.SALESFORCE_<SUFFIX>_JWT_KEY }}
+      #   run: |
+      #     umask 077
+      #     echo "$JWT_KEY" > ./server.key
+      #
+      # - name: Authenticate (<Name>)
+      #   if: steps.user.outputs.suffix == '<SUFFIX>'
+      #   id: auth_<name>
+      #   run: |
+      #     sf org login jwt \
+      #       --client-id "${{ secrets.SALESFORCE_<SUFFIX>_CLIENT_ID }}" \
+      #       --jwt-key-file ./server.key \
+      #       --username "${{ secrets.SALESFORCE_<SUFFIX>_USERNAME }}" \
+      #       --instance-url "${{ secrets.SALESFORCE_<SUFFIX>_LOGIN_URL }}" \
+      #       --alias target-org \
+      #       --set-default
+      #
+      # Then add `steps.auth_<name>.outcome == 'failure'` to the `if:` below.
+
+      - name: Report authentication failure
+        if: failure() && steps.auth_sameer.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '### ❌ Validation failed — authentication error',
+                '',
+                `**Sandbox:** ${{ steps.user.outputs.sandbox_label }}`,
+                '',
+                'Could not authenticate to Salesforce via JWT. Check that the',
+                'Connected App certificate, Client ID, and username secrets are',
+                'still valid for this sandbox.',
+                '',
+                `[View logs](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+              ].join('\n')
+            });
+
+      # ── 7. Check-only validation (dry-run, no deployment) ───────────────
+      - name: Validate deployment (check-only)
+        id: validate
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔍 CHECK-ONLY VALIDATION → ${{ steps.user.outputs.sandbox_label }}"
+          echo "Manifest: ${{ steps.manifest.outputs.manifest }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          sf project deploy start \
+            --target-org target-org \
+            --manifest "${{ steps.manifest.outputs.manifest }}" \
+            --dry-run \
+            --test-level RunLocalTests \
+            --wait 60 \
+            --json > validation-result.json
+          RUN_EXIT=$?
+
+          STATUS=$(jq -r '.result.status // .result.details.status // "Unknown"' validation-result.json)
+          DEPLOY_ID=$(jq -r '.result.id // "N/A"' validation-result.json)
+          COMPONENTS=$(jq -r '.result.numberComponentsTotal // (.result.details.componentSuccesses | length) // 0' validation-result.json)
+          TESTS_RUN=$(jq -r '.result.numberTestsCompleted // 0' validation-result.json)
+          TESTS_FAILED=$(jq -r '.result.numberTestErrors // .result.numberTestsFailed // 0' validation-result.json)
+          ERROR_MESSAGE=$(jq -r '.message // empty' validation-result.json)
+
+          {
+            echo "status=$STATUS"
+            echo "deploy_id=$DEPLOY_ID"
+            echo "components=$COMPONENTS"
+            echo "tests_run=$TESTS_RUN"
+            echo "tests_failed=$TESTS_FAILED"
+          } >> "$GITHUB_OUTPUT"
+
+          # Multi-line outputs (error text, test failure details) need the
+          # delimiter form so embedded newlines don't break GITHUB_OUTPUT.
+          {
+            echo "error_summary<<EOF"
+            if [ -n "$ERROR_MESSAGE" ]; then
+              echo "$ERROR_MESSAGE"
+            else
+              jq -r '.result.details.componentFailures[]? | "- \(.fullName // .componentType): \(.problem)"' validation-result.json
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "test_failures<<EOF"
+            jq -r '.result.details.runTestResult.failures[]? | "- \(.name).\(.methodName): \(.message)"' validation-result.json 2>/dev/null
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "📊 Status: $STATUS | Deploy ID: $DEPLOY_ID | Components: $COMPONENTS | Tests: $TESTS_RUN (failed: $TESTS_FAILED)"
+
+          if [ "$RUN_EXIT" -ne 0 ] || [ "$STATUS" != "Succeeded" ]; then
+            echo "::error::Validation failed"
+            exit 1
+          fi
+          echo "✅ VALIDATION PASSED"
+
+      # ── 8. Report results back on the PR ────────────────────────────────
+      - name: Post success comment
+        if: steps.validate.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '### ✅ Validation Passed',
+              '',
+              `* **Sandbox:** ${{ steps.user.outputs.sandbox_label }}`,
+              `* **Manifest used:** \`${{ steps.manifest.outputs.manifest }}\``,
+              `* **Deployment ID:** \`${{ steps.validate.outputs.deploy_id }}\``,
+              `* **Components validated:** ${{ steps.validate.outputs.components }}`,
+              `* **Tests executed:** ${{ steps.validate.outputs.tests_run }} (failed: ${{ steps.validate.outputs.tests_failed }})`,
+              '',
+              'This was a **check-only** run — nothing was deployed.',
+              '',
+              `[View logs](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body
+            });
+
+      - name: Post failure comment
+        if: steps.validate.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorSummary = `${{ steps.validate.outputs.error_summary }}`.trim() || '_No error detail captured._';
+            const testFailures = `${{ steps.validate.outputs.test_failures }}`.trim() || '_None_';
+
+            const body = [
+              '### ❌ Validation Failed',
+              '',
+              `* **Sandbox:** ${{ steps.user.outputs.sandbox_label }}`,
+              `* **Manifest used:** \`${{ steps.manifest.outputs.manifest }}\``,
+              `* **Deployment ID:** \`${{ steps.validate.outputs.deploy_id }}\``,
+              '',
+              '**Error summary:**',
+              '```',
+              errorSummary,
+              '```',
+              '',
+              '**Test failures:**',
+              '```',
+              testFailures,
+              '```',
+              '',
+              `[View logs](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body
+            });
+
+      # ── 9. Cleanup ───────────────────────────────────────────────────────
+      # Always runs, even if an earlier step failed, so the JWT key and
+      # validation JSON never linger on the runner past this job.
+      - name: Cleanup secrets and temp files
+        if: always()
+        run: |
+          rm -f ./server.key ./validation-result.json
+          echo "✓ Cleaned up temporary credential and result files"
